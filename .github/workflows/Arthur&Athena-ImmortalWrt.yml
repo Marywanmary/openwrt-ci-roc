@@ -1,0 +1,446 @@
+name: Arthur&Athena-ImmWrt
+
+on:
+  # 手动触发
+  workflow_dispatch:
+  # 定时触发：北京时间周五0点 = UTC周四16点
+  schedule:
+    - cron: '0 16 * * 4'
+  # 清理后触发
+  workflow_run:
+    workflows: ["Auto_Cleanup"]
+    types:
+      - completed
+
+env:
+  REPO_URL: https://github.com/laipeng668/openwrt.git  
+  REPO_BRANCH: master
+  CONFIG_FILE: configs/Arthur&Athena.config
+  GENERAL_CONFIG_FILE: configs/General.config
+  DIY_SCRIPT: scripts/Roc-script.sh
+  CLASH_KERNEL: amd64
+  MADS: false
+  UPLOAD_BIN_DIR: false
+  FIRMWARE_RELEASE: true
+  FIRMWARE_TAG: Arthur&Athena
+  TZ: Asia/Shanghai
+
+jobs:
+  Build:
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: Check Server Performance(检查服务器性能)
+      # Enable strict error handling mode, any command failure will terminate immediately
+      # 启用严格错误处理模式，任何命令失败都会立即终止
+      run: |
+        set -euo pipefail
+        
+        echo "警告⚠"
+        echo "分配的服务器性能有限，若选择的插件过多，务必注意CPU性能！"
+        echo -e "已知CPU型号（降序）：7763，8370C，8272CL，8171M，E5-2673 \n"
+        echo "--------------------------CPU信息--------------------------"
+        
+        # Use more reliable commands to get CPU information
+        # 使用更可靠的命令获取CPU信息
+        if command -v lscpu >/dev/null 2>&1; then
+          echo "CPU物理数量：$(lscpu | grep 'Socket(s):' | awk '{print $2}')"
+          echo -e "CPU核心信息：$(lscpu | grep 'Model name:' | cut -d: -f2 | xargs)"
+        else
+          echo "CPU物理数量：$(cat /proc/cpuinfo | grep "physical id" | sort | uniq | wc -l)"
+          echo -e "CPU核心信息：$(cat /proc/cpuinfo | grep name | cut -f2 -d: | uniq -c)"
+        fi
+        
+        echo "--------------------------内存信息--------------------------"
+        echo "已安装内存详细信息："
+        # Check if lshw command exists
+        # 检查lshw命令是否存在
+        if command -v lshw >/dev/null 2>&1; then
+          echo -e "$(sudo lshw -short -C memory | grep GiB) \n"
+        else
+          echo "内存信息获取失败 \n"
+        fi
+        
+        echo "--------------------------硬盘信息--------------------------"
+        # Safely get disk count
+        # 安全地获取硬盘数量
+        DISK_COUNT=$(ls /dev/sd* 2>/dev/null | grep -v [1-9] | wc -l)
+        echo "硬盘数量：$DISK_COUNT" && df -hT
+
+    - name: Maximize Available Disk Space(最大化可用磁盘空间​)
+      if: env.MADS == 'true'
+      uses: AdityaGarg8/remove-unwanted-software@master
+      with:
+        remove-dotnet: "true"
+        remove-android: "true"
+        remove-haskell: "true"
+        remove-codeql: "true"
+        remove-docker-images: "true"
+        remove-large-packages: "true"
+        remove-cached-tools: "true"
+        remove-swapfile: "true"
+
+    - name: Initialization Environment(初始化环境)
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      # Enable strict error handling mode
+      # 启用严格错误处理模式
+      run: |
+        set -euo pipefail
+        
+        # Update package manager and install dependencies
+        # 更新包管理器并安装依赖
+        sudo -E apt-get -y update || { echo "APT update failed"; exit 1; }
+        sudo -E apt-get -y install $(curl -fsSL is.gd/depends_ubuntu_2204) || { echo "Package installation failed"; exit 1; }
+        sudo -E systemctl daemon-reload || { echo "Systemctl daemon reload failed"; exit 1; }
+        sudo -E apt-get -y autoremove --purge || { echo "Autoremove failed"; exit 1; }
+        sudo -E apt-get -y clean || { echo "APT clean failed"; exit 1; }
+        sudo timedatectl set-timezone "$TZ" || { echo "Timezone setting failed"; exit 1; }
+
+    - name: Checkout(检出代码)
+      uses: actions/checkout@main
+
+    - name: Clone Source Code(克隆源代码)
+      # Enable strict error handling mode
+      # 启用严格错误处理模式
+      run: |
+        set -euo pipefail
+        
+        # Check workspace disk space
+        # 检查工作空间磁盘空间
+        df -hT $GITHUB_WORKSPACE || { echo "Disk space check failed"; exit 1; }
+        
+        # Create and set OpenWrt directory permissions
+        # 创建并设置OpenWrt目录权限
+        sudo mkdir -p /mnt/openwrt || { echo "Failed to create directory"; exit 1; }
+        sudo chown -R $(id -u):$(id -g) /mnt/openwrt || { echo "Failed to set ownership"; exit 1; }
+        
+        # Clone source code repository
+        # 克隆源代码仓库
+        git clone --depth 1 -b $REPO_BRANCH --single-branch $REPO_URL /mnt/openwrt || { echo "Git clone failed"; exit 1; }
+        cd /mnt/openwrt || { echo "Failed to change directory"; exit 1; }
+        
+        # Verify Git repository was successfully cloned
+        # 验证Git仓库是否成功克隆
+        if [ ! -d .git ]; then
+          echo "Git repository not found after clone"
+          exit 1
+        fi
+        
+        # Set environment variables
+        # 设置环境变量
+        echo "OPENWRT_PATH=$PWD" >> $GITHUB_ENV
+        VERSION_INFO=$(git show -s --date=short --format="作者: %an<br/>时间: %cd<br/>内容: %s<br/>hash: %H")
+        echo "VERSION_INFO=$VERSION_INFO" >> $GITHUB_ENV
+        
+        # Get kernel version information
+        # 获取内核版本信息
+        if [ -f target/linux/generic/kernel-6.12 ]; then
+          VERSION_KERNEL=$(grep -oP 'LINUX_KERNEL_HASH-\K[0-9]+\.[0-9]+\.[0-9]+' target/linux/generic/kernel-6.12)
+          echo "VERSION_KERNEL=$VERSION_KERNEL" >> $GITHUB_ENV
+        else
+          echo "Kernel version file not found"
+        fi
+
+    - name: Generate Variables(生成变量)
+      # Enable strict error handling mode
+      # 启用严格错误处理模式
+      run: |
+        set -euo pipefail
+        
+        # Check if configuration files exist
+        # 检查配置文件是否存在
+        if [ ! -f "$CONFIG_FILE" ]; then
+          echo "Configuration file not found: $CONFIG_FILE"
+          exit 1
+        fi
+        
+        # Copy configuration file and generate default config
+        # 复制配置文件并生成默认配置
+        cp "$CONFIG_FILE" "$OPENWRT_PATH/.config" || { echo "Config copy failed"; exit 1; }
+        cd "$OPENWRT_PATH" || { echo "Failed to change directory"; exit 1; }
+        make defconfig > /dev/null 2>&1 || { echo "Defconfig generation failed"; exit 1; }
+        
+        # Extract source repository name
+        # 提取源码仓库名称
+        SOURCE_REPO="$(echo "$REPO_URL" | awk -F '/' '{print $(NF)}')"
+        echo "SOURCE_REPO=${SOURCE_REPO}" >> $GITHUB_ENV
+        
+        # Extract device target platform information
+        # 提取设备目标平台信息
+        DEVICE_TARGET=$(grep CONFIG_TARGET_BOARD .config | awk -F '"' '{print $2}')
+        echo "DEVICE_TARGET=${DEVICE_TARGET}" >> $GITHUB_ENV
+        
+        DEVICE_SUBTARGET=$(grep CONFIG_TARGET_SUBTARGET .config | awk -F '"' '{print $2}')
+        echo "DEVICE_SUBTARGET=${DEVICE_SUBTARGET}" >> $GITHUB_ENV
+        
+        # Get Git commit hash and cache timestamp
+        # 获取Git提交哈希和缓存时间戳
+        echo "HASH=$(git log -1 --pretty=format:'%h')" >> $GITHUB_ENV
+        echo "CACHE_DATE=$(date +"%Y-%m-%d %H:%M:%S")" >> $GITHUB_ENV
+
+    - name: Cache Toolchain(缓存工具链)
+      uses: actions/cache@main
+      with:
+        key: ${{ env.SOURCE_REPO }}-${{ env.REPO_BRANCH }}-${{ env.DEVICE_TARGET }}-${{ env.DEVICE_SUBTARGET }}-${{ env.HASH }} ${{ env.CACHE_DATE }}
+        restore-keys: ${{ env.SOURCE_REPO }}-${{ env.REPO_BRANCH }}-${{ env.DEVICE_TARGET }}-${{ env.DEVICE_SUBTARGET }}-
+        path: |
+          ${{ env.OPENWRT_PATH }}/.ccache
+          ${{ env.OPENWRT_PATH }}/staging_dir
+
+    - name: Refresh The Cache(刷新缓存)
+      # Enable strict error handling mode
+      # 启用严格错误处理模式
+      run: |
+        set -euo pipefail
+        
+        # If staging_dir directory exists, refresh timestamps
+        # 如果存在staging_dir目录，则刷新时间戳
+        if [ -d "$OPENWRT_PATH/staging_dir" ]; then
+          find "$OPENWRT_PATH/staging_dir" -type d -name "stamp" -not -path "*target*" | while read -r dir; do
+              find "$dir" -type f -exec touch {} + || echo "Warning: Failed to touch files in $dir"
+          done
+        fi
+
+    - name: Install Feeds(安装feeds)
+      # Enable strict error handling mode
+      # 启用严格错误处理模式
+      run: |
+        set -euo pipefail
+        
+        # Change to OpenWrt directory and update feeds
+        # 切换到OpenWrt目录并更新feeds
+        cd "$OPENWRT_PATH" || { echo "Failed to change directory"; exit 1; }
+        ./scripts/feeds update -a || { echo "Feeds update failed"; exit 1; }
+        ./scripts/feeds install -a || { echo "Feeds install failed"; exit 1; }
+
+    - name: Load Custom Configuration(加载自定义配置)
+      # Enable strict error handling mode
+      # 启用严格错误处理模式
+      run: |
+        set -euo pipefail
+        
+        # Check if configuration files exist
+        # 检查配置文件是否存在
+        if [ ! -f "$CONFIG_FILE" ] || [ ! -f "$GENERAL_CONFIG_FILE" ]; then
+          echo "Required config files missing"
+          exit 1
+        fi
+        
+        # Merge configuration files
+        # 合并配置文件
+        cat "$CONFIG_FILE" "$GENERAL_CONFIG_FILE" > "$OPENWRT_PATH/.config" || { echo "Config merge failed"; exit 1; }
+        
+        # Set custom script permissions and execute
+        # 设置自定义脚本权限并执行
+        chmod +x "$DIY_SCRIPT" || { echo "Failed to set script permissions"; exit 1; }
+        cd "$OPENWRT_PATH" || { echo "Failed to change directory"; exit 1; }
+        "$GITHUB_WORKSPACE/$DIY_SCRIPT" || { echo "Custom DIY script failed"; exit 1; }
+
+    - name: Download DL Package(下载DL软件包)
+      # Enable strict error handling mode
+      # 启用严格错误处理模式
+      run: |
+        set -euo pipefail
+        
+        # Change directory and generate default configuration
+        # 切换目录并生成默认配置
+        cd "$OPENWRT_PATH" || { echo "Failed to change directory"; exit 1; }
+        make defconfig || { echo "Defconfig failed"; exit 1; }
+        
+        # Download dependencies
+        # 下载依赖包
+        make download -j$(nproc) || { echo "Package download failed"; exit 1; }
+        
+        # Clean up files smaller than 1KB (possibly failed downloads)
+        # 清理小于1KB的文件（可能是下载失败的文件）
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
+
+    - name: Compile Firmware(开始编译固件)
+      id: compile
+      # Enable strict error handling mode
+      # 启用严格错误处理模式
+      run: |
+        set -euo pipefail
+        
+        # Change to OpenWrt directory
+        # 切换到OpenWrt目录
+        cd "$OPENWRT_PATH" || { echo "Failed to change directory"; exit 1; }
+        
+        # Check if sufficient disk space is available
+        # 检查磁盘空间是否充足
+        FREE_SPACE=$(df -m . | tail -1 | awk '{print $4}')
+        if [ "$FREE_SPACE" -lt 2000 ]; then
+          echo "警告：可用空间不足2GB，可能影响编译"
+        fi
+        
+        echo -e "$(nproc) thread compile"
+        
+        # Multi-threaded compilation, if it fails try single-threaded compilation, then detailed mode compilation
+        # 多线程编译，如果失败则尝试单线程编译，再失败则详细模式编译
+        if ! make -j$(nproc); then
+          echo "第一轮编译失败，尝试单线程编译"
+          if ! make -j1; then
+            echo "单线程编译也失败，尝试详细模式编译"
+            if ! make -j1 V=s; then
+              echo "所有编译方式都失败"
+              exit 1
+            fi
+          fi
+        fi
+        
+        # Set compilation success flag and timestamp
+        # 设置编译成功标志和时间戳
+        echo "status=success" >> $GITHUB_OUTPUT
+        echo "DATE=$(date +"%Y-%m-%d %H:%M:%S")" >> $GITHUB_ENV
+        echo "FILE_DATE=$(date +"%Y.%m.%d")" >> $GITHUB_ENV
+
+    - name: Check Space Usage(检查空间使用情况)
+      if: (!cancelled())
+      # Enable strict error handling mode
+      # 启用严格错误处理模式
+      run: |
+        set -euo pipefail
+        df -hT
+
+    - name: Upload Bin Directory(上传固件)
+      if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
+      uses: actions/upload-artifact@main
+      with:
+        name: ${{ env.SOURCE_REPO }}-bin-${{ env.DEVICE_TARGET }}-${{ env.DEVICE_SUBTARGET }}-${{ env.FILE_DATE }}
+        path: ${{ env.OPENWRT_PATH }}/bin
+
+    - name: Organize Files(整理文件)
+      if: steps.compile.outputs.status == 'success'
+      # Enable strict error handling mode
+      # 启用严格错误处理模式
+      run: |
+        set -euo pipefail
+        
+        # Change to firmware output directory safely
+        # 安全地切换到固件输出目录
+        cd "$OPENWRT_PATH/bin/targets" || { echo "Failed to change to targets directory"; exit 1; }
+        
+        # Find actual firmware directory using safe method
+        # 使用安全方法查找实际的固件目录
+        TARGET_DIR=""
+        for dir in */*; do
+          if [ -d "$dir" ] && [ -f "$dir/config.buildinfo" ]; then
+            TARGET_DIR="$dir"
+            break
+          fi
+        done
+        
+        if [ -z "$TARGET_DIR" ]; then
+          echo "No valid firmware directory found"
+          exit 1
+        fi
+        
+        cd "$TARGET_DIR" || { echo "Failed to change to firmware directory"; exit 1; }
+        
+        # Check if config file exists
+        # 检查配置文件是否存在
+        if [ ! -f "$OPENWRT_PATH/.config" ]; then
+          echo "Config file missing in build directory"
+          exit 1
+        fi
+        
+        # Copy and rename configuration file
+        # 复制和重命名配置文件
+        cp "$OPENWRT_PATH/.config" Arthur.Athena.config || { echo "Config copy failed"; exit 1; }
+        mv config.buildinfo Arthur.Athena.config.buildinfo || { echo "Buildinfo rename failed"; exit 1; }
+        
+        # Safely rename manifest file
+        # 安全地重命名manifest文件
+        if [ -f "openwrt-qualcommax-ipq60xx.manifest" ]; then
+          mv openwrt-qualcommax-ipq60xx.manifest openwrt-qualcommax-ipq60xx-Arthur.Athena.manifest || { echo "Manifest rename failed"; exit 1; }
+        fi
+        
+        # Create packages directory and move APK files
+        # 创建packages目录并移动APK文件
+        mkdir -p packages || { echo "Failed to create packages directory"; exit 1; }
+        if [ -d "$OPENWRT_PATH/bin/packages" ]; then
+          find "$OPENWRT_PATH/bin/packages" -name "*.apk" -exec mv {} packages/ \; 2>/dev/null || true
+        fi
+        
+        # Create compressed package and clean temporary files
+        # 创建压缩包并清理临时文件
+        tar -zcf Arthur.Athena.Packages.tar.gz packages || { echo "Package archive creation failed"; exit 1; }
+        rm -rf packages feeds.buildinfo version.buildinfo sha256sums profiles.json || { echo "Cleanup failed"; exit 1; }
+        
+        # Set firmware path environment variable
+        # 设置固件路径环境变量
+        echo "FIRMWARE_PATH=$PWD" >> $GITHUB_ENV
+
+    - name: Upload Firmware To Artifact(将固件上传到Artifact)
+      if: steps.compile.outputs.status == 'success' && env.FIRMWARE_RELEASE != 'true'
+      uses: actions/upload-artifact@main
+      with:
+        name: ${{ env.SOURCE_REPO }}-firmware-${{ env.DEVICE_TARGET }}-${{ env.DEVICE_SUBTARGET }}-${{ env.FILE_DATE }}
+        path: ${{ env.FIRMWARE_PATH }}
+
+    - name: Upload Firmware To Release(发布固件)
+      if: steps.compile.outputs.status == 'success' && env.FIRMWARE_RELEASE == 'true'
+      uses: ncipollo/release-action@main
+      with:
+        name: ${{ env.DATE }} for ${{ env.FIRMWARE_TAG }}
+        allowUpdates: true
+        tag: ${{ env.FIRMWARE_TAG }}
+        token: ${{ secrets.GITHUB_TOKEN }}
+        artifacts: ${{ env.FIRMWARE_PATH }}/*
+        body: |
+          **This is OpenWrt Firmware for ${{ env.FIRMWARE_TAG }}**
+          ### 📒 固件信息
+          - 这是开启全功能NSS的6.12内核固件，默认主题为Argon；该固件在ImmortalWrt的基础上，添加了额外的软件包，具体详见对应机型的config。
+          - 💻 这是 ${{ env.FIRMWARE_TAG }} 平台使用的 OpenWrt 固件
+          - ⚽ 固件源码: ${{ env.REPO_URL }}
+          - 💝 源码分支: ${{ env.REPO_BRANCH }}
+          - 🌐 默认地址: **192.168.111.1**
+          - 🔑 默认密码: none
+          - 🚀 WiFi名称: **Star**
+          - 🔑 WiFi密码: 12345678
+          ### 🧊 固件版本
+          - 固件内核版本：**${{ env.VERSION_KERNEL }}**
+          - 固件编译前最后一次➦[主源码](${{ env.REPO_URL }})更新记录
+          - ${{ env.VERSION_INFO }}
+
+    - name: Delete Old Cache(删除旧缓存)
+      # Enable strict error handling mode
+      # 启用严格错误处理模式
+      run: |
+        set -euo pipefail
+        
+        # Check if GitHub CLI is available
+        # 检查GitHub CLI是否可用
+        if ! command -v gh >/dev/null 2>&1; then
+          echo "GitHub CLI not available, skipping cache cleanup"
+          exit 0
+        fi
+        
+        # Get and delete old caches
+        # 获取并删除旧缓存
+        echo "正在清理缓存..."
+        gh cache list --key "${{ env.SOURCE_REPO }}-${{ env.REPO_BRANCH }}-${{ env.DEVICE_TARGET }}-${{ env.DEVICE_SUBTARGET }}-" --json key --jq '.[] | .key' 2>/dev/null | while read -r key; do
+          if [ -n "$key" ]; then
+            echo "删除缓存: $key"
+            gh cache delete "$key" 2>/dev/null || echo "缓存删除失败: $key"
+          fi
+        done
+        
+        # Output cache status information
+        # 输出缓存状态信息
+        echo "========cache status========"
+        if [ -d "$OPENWRT_PATH/.ccache" ]; then
+          echo "ccache: $(du -sh "$OPENWRT_PATH/.ccache" | cut -f 1)"
+        else
+          echo "ccache: 无"
+        fi
+        
+        if [ -d "$OPENWRT_PATH/staging_dir" ]; then
+          echo "staging: $(du -sh "$OPENWRT_PATH/staging_dir" | cut -f 1)"
+        else
+          echo "staging: 无"
+        fi
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
