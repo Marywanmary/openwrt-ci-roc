@@ -19,7 +19,7 @@ env:
   GENERAL_CONFIG_FILE: configs/General.config
   DIY_SCRIPT: scripts/Roc-script.sh
   CLASH_KERNEL: amd64
-  MADS: false
+  MADS: true
   UPLOAD_BIN_DIR: false
   FIRMWARE_RELEASE: true
   FIRMWARE_TAG: Arthur&Athena
@@ -79,6 +79,21 @@ jobs:
         remove-large-packages: "true"
         remove-cached-tools: "true"
         remove-swapfile: "true"
+
+    # 验证配置文件存在
+    - name: Verify Config Files
+      run: |
+        echo "Looking for config files..."
+        find . -type f \( -name "*.json" -o -name "*.yaml" -o -name "*.yml" \) | head -10
+        # 检查特定配置文件是否存在
+        if [ -f "config/custom-config.json" ]; then
+          echo "✓ Custom config file found"
+        else
+          echo "⚠ Custom config file not found, creating default..."
+          mkdir -p config
+          echo "{}" > config/custom-config.json
+        fi
+    
 
     - name: Initialization Environment(初始化环境)
       env:
